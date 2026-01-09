@@ -146,3 +146,257 @@ FROM (
     GROUP BY dc.customer_id, dc.signup_date
 ) t;
 
+
+# Cohort = month of sign up
+
+SELECT
+	DATE_FORMAT(signup_date, '%Y-%m-01') AS cohort_month,
+    COUNT(*) AS customer_signed_up
+FROM dim_customers
+GROUP BY cohort_month
+ORDER BY cohort_month;
+
+
+SELECT
+    DATE_FORMAT(dc.signup_date, '%Y-%m-01') AS cohort_month,
+    COUNT(DISTINCT fr.customer_id) AS activated_customers
+FROM dim_customers dc
+JOIN fact_revenue fr
+  ON dc.customer_id = fr.customer_id
+GROUP BY cohort_month
+ORDER BY cohort_month;
+
+SELECT 
+	DATE_FORMAT(dc.signup_date, '%Y-%m-01') AS cohort_month,
+    TIMESTAMPDIFF(
+		MONTH,
+        DATE_FORMAT(dc.signup_date, '%Y-%m-01'),
+        fr.revenue_date
+	) AS months_since_signup,
+    COUNT(DISTINCT dc.customer_id) AS active_customes
+FROM dim_customers dc
+JOIN fact_revenue fr
+ON dc.customer_id = fr.customer_id
+GROUP BY cohort_month, months_since_signup
+ORDER BY cohort_month, months_since_signup;
+
+
+WITH cohort_sizes AS (
+    SELECT
+        DATE_FORMAT(signup_date, '%Y-%m-01') AS cohort_month,
+        COUNT(DISTINCT customer_id) AS cohort_size
+    FROM dim_customers
+    GROUP BY cohort_month
+)
+SELECT
+    c.cohort_month,
+    TIMESTAMPDIFF(
+        MONTH,
+        DATE_FORMAT(dc.signup_date, '%Y-%m-01'),
+        fr.revenue_date
+    ) AS months_since_signup,
+    COUNT(DISTINCT dc.customer_id) AS active_customers,
+    ROUND(
+        COUNT(DISTINCT dc.customer_id) * 1.0 / c.cohort_size,
+        4
+    ) AS retention_rate
+FROM dim_customers dc
+JOIN fact_revenue fr
+  ON dc.customer_id = fr.customer_id
+JOIN cohort_sizes c
+  ON DATE_FORMAT(dc.signup_date, '%Y-%m-01') = c.cohort_month
+GROUP BY c.cohort_month, months_since_signup
+ORDER BY c.cohort_month, months_since_signup;
+
+
+# USER-LEVEL METRICS
+SELECT 
+	customer_id,
+    COUNT(DISTINCT revenue_date) AS active_months,
+    SUM(amount) AS total_revenue,
+    ROUND(AVG(amount),2) AS avg_monthly_revenue
+FROM fact_revenue
+GROUP BY customer_id;
+## ORDER BY total_revenue DESC;
+
+
+# Rank users by total revenue
+WITH user_revenue AS(
+	SELECT
+		customer_id,
+        SUM(amount) AS total_revenue
+	FROM fact_revenue
+    GROUP BY customer_id
+),
+ranked_users AS(
+	SELECT
+		customer_id,
+        total_revenue,
+        NTILE(5) OVER (ORDER BY total_revenue DESC) AS revenue_bucket
+	FROM user_revenue
+)
+SELECT 
+	MIN(total_revenue) AS revenue_80th_percentile
+FROM ranked_users
+WHERE revenue_bucket =1;
+
+
+WITH user_metrics AS(
+	SELECT 
+		customer_id,
+        COUNT(DISTINCT revenue_date) AS active_months,
+        SUM(amount) AS total_revenue,
+        ROUND(AVG(amount),2) AS avg_monthly_revenue
+	FROM fact_revenue
+    GROUP BY customer_id
+),
+revenue_cutoff AS(
+	SELECT
+		MIN(total_revenue) AS cutoff
+	FROM(
+		SELECT
+			total_revenue,
+            NTILE(5) OVER(ORDER BY total_revenue DESC) AS revenue_bucket
+		FROM user_metrics
+        )t
+	WHERE revenue_bucket = 1
+)
+SELECT
+	um.customer_id,
+    um.active_months,
+    um.total_revenue,
+    um.avg_monthly_revenue,
+    CASE 
+		WHEN um.total_revenue >= rc.cutoff THEN 'Power User'
+        ELSE 'Regular User'
+	END AS user_segment
+FROM user_metrics um
+CROSS JOIN revenue_cutoff rc;
+
+
+WITH user_revenue AS (
+    SELECT
+        customer_id,
+        SUM(amount) AS total_revenue
+    FROM fact_revenue
+    GROUP BY customer_id
+),
+ranked_users AS (
+    SELECT
+        customer_id,
+        total_revenue,
+        NTILE(5) OVER (ORDER BY total_revenue DESC) AS revenue_bucket
+    FROM user_revenue
+),
+cutoff AS (
+    SELECT
+        MIN(total_revenue) AS power_user_cutoff
+    FROM ranked_users
+    WHERE revenue_bucket = 1
+)
+SELECT
+    CASE
+        WHEN ur.total_revenue >= c.power_user_cutoff THEN 'Power User'
+        ELSE 'Regular User'
+    END AS user_segment,
+    COUNT(*) AS users,
+    ROUND(SUM(ur.total_revenue), 2) AS segment_revenue,
+    ROUND(
+        SUM(ur.total_revenue) / SUM(SUM(ur.total_revenue)) OVER (),
+        4
+    ) AS revenue_contribution_pct
+FROM user_revenue ur
+CROSS JOIN cutoff c
+GROUP BY user_segment;
+
+WITH user_metrics AS (
+    SELECT
+        customer_id,
+        COUNT(DISTINCT revenue_date) AS active_months,
+        SUM(amount) AS total_revenue,
+        ROUND(AVG(amount), 2) AS avg_monthly_revenue
+    FROM fact_revenue
+    GROUP BY customer_id
+),
+ranked_users AS (
+    SELECT
+        *,
+        NTILE(5) OVER (ORDER BY total_revenue DESC) AS revenue_bucket
+    FROM user_metrics
+),
+cutoff AS (
+    SELECT
+        MIN(total_revenue) AS power_user_cutoff
+    FROM ranked_users
+    WHERE revenue_bucket = 1
+)
+SELECT
+    CASE
+        WHEN um.total_revenue >= c.power_user_cutoff THEN 'Power User'
+        ELSE 'Regular User'
+    END AS user_segment,
+    COUNT(*) AS users,
+	ROUND(AVG(active_months), 2) AS avg_active_months,
+    ROUND(AVG(avg_monthly_revenue), 2) AS avg_monthly_revenue,
+    ROUND(AVG(total_revenue), 2) AS avg_lifetime_revenue
+FROM user_metrics um
+CROSS JOIN cutoff c
+GROUP BY user_segment;
+
+-- Plan Distribution
+WITH user_revenue AS (
+    SELECT
+        customer_id,
+        SUM(amount) AS total_revenue
+    FROM fact_revenue
+    GROUP BY customer_id
+),
+ranked_users AS (
+    SELECT
+        customer_id,
+        total_revenue,
+        NTILE(5) OVER (ORDER BY total_revenue DESC) AS revenue_bucket
+    FROM user_revenue
+),
+cutoff AS (
+    SELECT
+        MIN(total_revenue) AS power_user_cutoff
+    FROM ranked_users
+    WHERE revenue_bucket = 1
+),
+user_segments AS (
+    SELECT
+        ur.customer_id,
+        CASE
+            WHEN ur.total_revenue >= c.power_user_cutoff THEN 'Power User'
+            ELSE 'Regular User'
+        END AS user_segment
+    FROM user_revenue ur
+    CROSS JOIN cutoff c
+)
+SELECT
+    dc.plan_type,
+    us.user_segment,
+    COUNT(DISTINCT us.customer_id) AS users
+FROM user_segments us
+JOIN dim_customers dc
+  ON us.customer_id = dc.customer_id
+GROUP BY dc.plan_type, us.user_segment
+ORDER BY dc.plan_type, us.user_segment;
+
+
+-- livetime value by plan
+SELECT 
+	dc.plan_type,
+    ROUND(AVG(ur.total_revenue),2) As avg_ltv
+FROM(
+	SELECT 
+		customer_id,
+        SUM(amount) AS total_revenue
+	FROM fact_revenue
+    GROUP BY customer_id
+) ur
+JOIN dim_customers dc
+ON ur.customer_id = dc.customer_id
+GROUP BY dc.plan_type
+ORDER BY avg_ltv DESC;
